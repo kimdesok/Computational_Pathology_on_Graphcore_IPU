@@ -1,5 +1,5 @@
--git needs to be installed in the server's Python env.
--In the terminal of Jupyter Lab on my PC provided by the server's Backend application,
+# git needs to be installed in the server's Python env.
+# In the terminal of Jupyter Lab on my PC provided by the server's Backend application,
 $ python -m pip install --upgrade jupyterlab-git
 
 $ git --version
@@ -13,3 +13,9 @@ git add .
 git commit -m "Describe your code updates here"
 
 git push origin main
+
+# How to monitor the IPU
+$ gc-monitor
+$ watch -n 2 gc-monitor
+
+$ gc-info -l
