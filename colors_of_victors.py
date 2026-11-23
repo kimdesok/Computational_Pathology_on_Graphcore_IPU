@@ -3,7 +3,7 @@
 # \033[38;2;R;G;Bm sets the text color (using white/black for contrast)
 # \033[0m resets all formatting
 
-# Ukraine Sky Blue: RGB (0, 91, 187) Ukraine Yellow: RGB (255, 213, 0)
+# Sky Blue: RGB (0, 91, 187) Yellow: RGB (255, 213, 0)
 # from color-of-victory import BLUE_BG as bb, YELLOW_BG as yb, WHITE_TEXT as wt, BLACK_TEXT as bt, RESET as rset
 
 BLUE_BG = "\033[48;2;0;91;187m"
