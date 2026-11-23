@@ -13,6 +13,10 @@ import subprocess, json, threading, time
 import torch
 import torch.nn as nn
 import torchvision.models as models
+
+import torch.nn.functional as F
+import poptorch
+
 from torchvision import transforms
 from datasets import load_dataset, load_from_disk
 from collections import Counter
@@ -25,6 +29,13 @@ import timm
 import gc
 import os
 os.environ["POPTORCH_LOG_LEVEL"] = "ERR"
+
+
+RESNET_MODELS = {
+    "resnet18": (models.resnet18, models.ResNet18_Weights.IMAGENET1K_V1),
+    "resnet34": (models.resnet34, models.ResNet34_Weights.IMAGENET1K_V1),
+    "resnet50": (models.resnet50, models.ResNet50_Weights.IMAGENET1K_V2),
+}
 
 import warnings
 
@@ -61,21 +72,109 @@ class Camelyon17Dataset(torch.utils.data.Dataset):
             image = self.transform(image)
         return image, label
 
+def create_resnet(model_name, num_classes=2, pretrained=True):
+    if model_name not in RESNET_MODELS:
+        raise ValueError(f"Unsupported ResNet: {model_name}")
+    constructor, weights = RESNET_MODELS[model_name]
+    backbone = constructor(weights=weights if pretrained else None)
+    backbone.fc = nn.Linear(backbone.fc.in_features, num_classes)
+    return backbone
 
-class ResNet18Camelyon(nn.Module):
-    def __init__(self, num_classes=2, pretrained=True):
+
+class ResNetCamelyon(nn.Module):
+    def __init__(self, model_name="resnet18", num_classes=2, pretrained=True):
         super().__init__()
-        weights = models.ResNet18_Weights.IMAGENET1K_V2 if pretrained else None
-        self.backbone = models.resnet18(weights=weights)
-        in_features = self.backbone.fc.in_features
-        self.backbone.fc = nn.Linear(in_features, num_classes)
+        self.backbone = create_resnet(model_name, num_classes, pretrained)
 
     def forward(self, x, labels=None):
+        x = x.to(self.backbone.conv1.weight.dtype)
         logits = self.backbone(x)
+
         if labels is None:
             return logits
-        loss = torch.nn.functional.cross_entropy(logits, labels)
+        return logits, F.cross_entropy(logits.float(), labels)
+
+
+
+class ResNetCamelyonIPU(nn.Module):
+    def __init__(self, model_name="resnet18", num_classes=2,
+                 pretrained=True, num_stages=4):
+        super().__init__()
+        self.backbone = create_resnet(model_name, num_classes, pretrained)
+        self.num_stages = num_stages
+
+        # Flatten residual groups without registering duplicate modules
+        b = self.backbone
+        self.blocks = tuple(
+            block for layer in (b.layer1, b.layer2, b.layer3, b.layer4)
+            for block in layer
+        )
+
+        # Partition residual blocks according to architecture
+        self.stage_blocks = {
+            "resnet18": {
+                4: [2, 2, 2, 2],
+                8: [1, 1, 1, 1, 1, 1, 1, 1]
+            },
+            "resnet34": {
+                4: [3, 4, 6, 3],
+                8: [2, 2, 2, 2, 2, 2, 2, 2]
+            },
+            "resnet50": {
+                4: [3, 4, 6, 3],
+                8: [2, 2, 2, 2, 2, 2, 2, 2]
+            }
+        }
+
+        if model_name not in self.stage_blocks:
+            raise ValueError(f"Unsupported model: {model_name}")
+        if num_stages not in self.stage_blocks[model_name]:
+            raise ValueError("num_stages must be 4 or 8")
+
+        self.partition = self.stage_blocks[model_name][num_stages]
+
+        assert len(self.partition) == num_stages
+        assert sum(self.partition) == len(self.blocks)
+
+    def forward(self, x, labels=None):
+        b = self.backbone
+        block_idx = 0
+
+        for stage, n_blocks in enumerate(self.partition):
+            with poptorch.Block(f"Stage_{stage}", ipu_id=stage):
+
+                # First stage: ResNet stem
+                if stage == 0:
+                    x = b.conv1(x)
+                    x = b.bn1(x)
+                    x = b.relu(x)
+                    x = b.maxpool(x)
+
+                # Residual blocks assigned to this IPU
+                for _ in range(n_blocks):
+                    x = self.blocks[block_idx](x)
+                    block_idx += 1
+
+                # Last stage: classification head
+                if stage == self.num_stages - 1:
+                    x = b.avgpool(x)
+                    x = torch.flatten(x, 1)
+                    x = x.to(b.fc.weight.dtype)
+                    
+                    #print(f"FC input dtype: {x.dtype}")
+                    #print(f"FC weight dtype: {b.fc.weight.dtype}")
+                    #print(f"FC bias dtype: {b.fc.bias.dtype}")
+
+                    logits = b.fc(x)
+
+                    if labels is not None:
+                        loss = F.cross_entropy(logits.float(), labels)
+
+        if labels is None:
+            return logits
         return logits, loss
+
+
 
 class ViTCamelyon(nn.Module):
     def __init__(self, model_name=None, num_classes=2, pretrained=True, drop_path_rate=0.1):
@@ -86,13 +185,17 @@ class ViTCamelyon(nn.Module):
             num_classes=num_classes,
             drop_path_rate=drop_path_rate
         )
-
+    
     def forward(self, x, labels=None):
+        x = x.to(self.backbone.patch_embed.proj.weight.dtype)
         logits = self.backbone(x)
+
         if labels is None:
             return logits
-        loss = torch.nn.functional.cross_entropy(logits, labels)
+
+        loss = torch.nn.functional.cross_entropy(logits.float(), labels)
         return logits, loss
+
 
 class ViTCamelyonIPU(nn.Module):
 
@@ -117,19 +220,18 @@ class ViTCamelyonIPU(nn.Module):
         if sum(self.stage_blocks[num_stages]) != len(self.backbone.blocks):
             raise ValueError("Stage partition does not match transformer depth")
 
+    
     def forward(self, x, labels=None):
-     
         block_idx = 0
+
         for stage, n_blocks in enumerate(self.stage_blocks[self.num_stages]):
-            
-            # --- STAGE 0 (IPU 0): Patch Embeddings & Transformer Blocks 0-2 ---
             with poptorch.Block(f"Stage_{stage}", ipu_id=stage):
                 if stage == 0:
+                    x = x.to(self.backbone.patch_embed.proj.weight.dtype)
                     x = self.backbone.patch_embed(x)
                     x = self.backbone._pos_embed(x)
                     x = self.backbone.norm_pre(x)
-             
-                # Process the first 3 transformer blocks
+
                 for _ in range(n_blocks):
                     x = self.backbone.blocks[block_idx](x)
                     block_idx += 1
@@ -137,14 +239,42 @@ class ViTCamelyonIPU(nn.Module):
                 if stage == self.num_stages - 1:
                     x = self.backbone.norm(x)
                     logits = self.backbone.forward_head(x)
-                    
-                    if labels is not None:
-                        loss = torch.nn.functional.cross_entropy(logits, labels)
 
-        if labels is None: return logits
+                    if labels is not None:
+                        loss = torch.nn.functional.cross_entropy(
+                            logits.float(), labels
+                        )
+                        loss = poptorch.identity_loss(loss, reduction="mean")
+
+        if labels is None:
+            return logits
         return logits, loss
+
     
-    
+
+def create_camelyon_model(model_name, parallel_mode,
+                          num_classes=2, pretrained=True):
+
+    if model_name.startswith("resnet"):
+        if parallel_mode == "data":
+            return ResNetCamelyon(model_name, num_classes, pretrained)
+
+        num_stages = {
+            "model0": 4,
+            "model1": 8,
+            "hybrid0": 4,
+            "hybrid1": 4,
+        }.get(parallel_mode)
+
+        if num_stages is None:
+            raise ValueError(f"Unsupported mode: {parallel_mode}")
+
+        return ResNetCamelyonIPU(
+            model_name, num_classes, pretrained, num_stages
+        )
+
+    raise ValueError(f"Unsupported model: {model_name}")
+
 def make_random_subset(hf_dataset, n_samples=None, seed=42):
     shuffled = hf_dataset.shuffle(seed=seed)
     if n_samples is None:
@@ -358,33 +488,54 @@ def get_data(dataset_path, cam_dataset, my_transform, rep_fact, device_itr, grad
 
     return train_loader, val_loader, test_loader, train_opts, valid_opts 
 
+
+def freeze_bn(model):
+    for m in model.modules():
+        if isinstance(m, nn.modules.batchnorm._BatchNorm):
+            m.eval()
+
 def get_models(model_name, parallel_mode, drop_path_rate=0.1):
-    
-    num_stages = 8 if parallel_mode == "model1" else 4
-    
-    if(parallel_mode != "data"):
-        model = ViTCamelyonIPU(model_name, num_classes=2, pretrained=True, num_stages=num_stages, drop_path_rate=drop_path_rate)
-        val_model = ViTCamelyonIPU(model_name, num_classes=2, pretrained=False, num_stages=num_stages, drop_path_rate=drop_path_rate)
-        test_model = ViTCamelyonIPU(model_name, num_classes=2, pretrained=False, num_stages=num_stages,  drop_path_rate=drop_path_rate)
-    else:
-        model = ViTCamelyon(model_name, num_classes=2, pretrained=True, drop_path_rate=drop_path_rate)
-        val_model = ViTCamelyon(model_name, num_classes=2, pretrained=False, drop_path_rate=drop_path_rate)
-        test_model = ViTCamelyon(model_name, num_classes=2, pretrained=False, drop_path_rate=drop_path_rate)
-        
-    #print("Parallel mode:", parallel_mode)
-    if parallel_mode != "data":
-        print(f"\nModel stages: {model.num_stages} | Stage blocks: {model.stage_blocks[model.num_stages]} | "
-              f"Transformer depth: {len(model.backbone.blocks)}" )
+    stage_map = {
+        "model0": 4,
+        "model1": 8,
+        "hybrid0": 4,
+        "hybrid1": 4
+    }
 
-    #Cast model to FP16
-    model.half()
-    model.train()
-    val_model.half()
-    test_model.half()
+    if parallel_mode not in (*stage_map, "data"):
+        raise ValueError(f"Unsupported parallel mode: {parallel_mode}")
 
-    print(f"\nThe model: {model_name} and its parameter tensors : {len(list(model.parameters()))}")
-    
+    def build_model(pretrained):
+        if model_name.startswith("resnet"):
+            if parallel_mode == "data":
+                return ResNetCamelyon(
+                    model_name, num_classes=2, pretrained=pretrained
+                )
+            return ResNetCamelyonIPU(
+                model_name, num_classes=2, pretrained=pretrained,
+                num_stages=stage_map[parallel_mode]
+            )
+
+        elif model_name.startswith("vit"):
+            if parallel_mode == "data":
+                return ViTCamelyon(
+                    model_name, num_classes=2, pretrained=pretrained,
+                    drop_path_rate=drop_path_rate
+                )
+            return ViTCamelyonIPU(
+                model_name, num_classes=2, pretrained=pretrained,
+                num_stages=stage_map[parallel_mode],
+                drop_path_rate=drop_path_rate
+            )
+
+        raise ValueError(f"Unsupported model: {model_name}")
+
+    model = build_model(pretrained=True)
+    val_model = build_model(pretrained=False)
+    test_model = build_model(pretrained=False)
+
     return model, val_model, test_model
+
 
 def plot_training(history, save_path, title_text="Loss and Accuracy"):
     epochs = range(1, len(history["train_loss"]) + 1)
@@ -394,7 +545,7 @@ def plot_training(history, save_path, title_text="Loss and Accuracy"):
 
     axes[0].plot(epochs, history["train_loss"], label="Train")
     axes[0].plot(epochs, history["val_loss"], label="Validation")
-    axes[0].set_ylim(0.0, 0.5)
+    axes[0].set_ylim(0.0, 0.7)
     axes[0].set(title="Loss", xlabel="Epoch", ylabel="Cross-entropy")
     axes[0].legend()
 
@@ -405,7 +556,7 @@ def plot_training(history, save_path, title_text="Loss and Accuracy"):
 
     axes[2].plot(epochs, history["lr"])
     axes[2].set(title="Learning rate", xlabel="Epoch", ylabel="LR")
-    axes[2].set_ylim(1e-8, 1e-5)
+    axes[2].set_ylim(1e-8, 1e-3)
     axes[2].set_yscale("log")
 
     for ax in axes: ax.grid(alpha=0.25)
@@ -438,6 +589,8 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from pathlib import Path
 
+from datetime import datetime
+
 
 # Note: Ensure transforms, get_data, get_models, evaluate_ipu, 
 # IPUPowerMonitor, and cleanup_poptorch are imported/defined in your environment scope.
@@ -465,13 +618,14 @@ def main():
     MODE = "train"
 
     # Constants
-    num_epochs = 500
-    current_decay = 1e-4
-    patience = 20
-    lr_patience = 6
+    num_epochs = 100
+    current_decay = 5e-2
+    patience = 10
+    lr_patience = 3
     lr_factor = 0.5
     min_lr = 1e-9
-    drop_path_rate = 0.2
+    drop_path_rate = 0.3
+    warmup_epochs = 10  # Ramps up learning rate over the first 10 epochs
     
     # Define the base transformations in a standard list
     transform_list = [
@@ -506,7 +660,7 @@ def main():
           f"   Replication fact={rep_fact} | Device itr={device_itr} | Gradient accum={grad_accum} |")
     print('-'*100)
     
-    short_name = f'{model_name.split("_")[0]}_{model_name.split("_")[1]}'
+    short_name = "_".join(model_name.split("_")[:2])
     
     os.makedirs(expr_type, exist_ok=True)
     
@@ -521,17 +675,22 @@ def main():
     )
     
     full_train = len(train_loader.dataset)
-    #print("No. of patches used for training =", full_train)
+    print("No. of patches used for training =", full_train)
     
     if aug_dp in ["baseline", "color_jitter"]:
         drop_path_rate = 0.0
       
     model, val_model, test_model = get_models(model_name, parallel_mode, drop_path_rate)
+    model.train()
+    freeze_bn(model)
 
     current_lr = learn_rate
-    optimizer = torch.optim.AdamW(model.parameters(), lr=learn_rate, weight_decay=current_decay)
+    
+    #optimizer = torch.optim.AdamW(model.parameters(), lr=learn_rate, weight_decay=current_decay)
+    optimizer = poptorch.optim.AdamW(model.parameters(), lr=learn_rate, weight_decay=current_decay)
 
     poptorch_model = poptorch.trainingModel(model, options=train_opts, optimizer=optimizer)
+    
     val_model.load_state_dict(model.state_dict())
     val_model.eval()
 
@@ -544,9 +703,8 @@ def main():
     # training loss curves
     history = {"train_loss": [], "val_loss": [], "val_acc": [], "lr": []}
     
-    from datetime import datetime
     my_time_stamp = datetime.now().strftime("%d-%m-%Y_%H:%M")
-    print(my_time_stamp)
+    print("Time:", my_time_stamp)
     
     # Use the same ID everywhere: model paths in expr_type and .csv & .png files in 'curves' directories, and benchmark.csv
     time_stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")  # to generate the file name
@@ -564,6 +722,8 @@ def main():
     os.makedirs(str(CURVE_DIR), exist_ok=True)  # saving the loss curves
  
     start_time = time.time()
+    
+    print(f"🔥 Starting training with a {warmup_epochs}-epoch linear warmup to target LR: {learn_rate:.2e}")
 
     # ----------------------------------------------------
     # Core Training Loop Execution
@@ -572,6 +732,17 @@ def main():
         running_loss = 0.0 
         n_steps = 0
         time0 = time.time()
+
+        # Learning Rate Warmup Logic
+        if epoch < warmup_epochs:
+            # Linearly scale LR from min_lr up to the target learn_rate
+            current_lr = min_lr + (learn_rate - min_lr) * ((epoch + 1) / warmup_epochs)
+            for group in optimizer.param_groups:
+                group["lr"] = current_lr
+            # Tell PopTorch to update the compiled device engine with the new warmup LR
+            poptorch_model.setOptimizer(optimizer)
+            if epoch == 0 or (epoch + 1) == warmup_epochs:
+                print(f" [Warmup Stage] Setting learning rate to {current_lr:.2e}")
 
         poptorch_model.train()
 
@@ -590,6 +761,26 @@ def main():
         if val_has_compiled:
             poptorch_val.attachToDevice()
             poptorch_val.copyWeightsToDevice()
+            
+            
+        # evaluate the training model's checkpoint directly on the CPU, bypassing PopTorch entirely 
+        if model_name.startswith("resnet"):
+            cpu_model = ResNetCamelyon(model_name, pretrained=False)
+            cpu_model.load_state_dict(val_model.state_dict())
+            cpu_model.float().eval()
+
+            images, labels = next(iter(val_loader))
+
+            with torch.no_grad():
+                logits_cpu = cpu_model(images.float())
+                logits_ipu = poptorch_val(images.half()).float()
+
+                loss_cpu = F.cross_entropy(logits_cpu, labels)
+                loss_ipu = F.cross_entropy(logits_ipu, labels)
+
+            #print("CPU loss:", loss_cpu.item())
+            #print("IPU loss:", loss_ipu.item())
+            #print("Max logit diff:", (logits_cpu-logits_ipu).abs().max().item())
 
         val_loss, val_acc = evaluate_ipu(poptorch_val, val_loader)
         val_has_compiled = True
@@ -614,13 +805,15 @@ def main():
             torch.save(model.state_dict(), checkpoint_path)
         else:
             epochs_without_improvement += 1
-            epochs_without_lr_improvement += 1
+            # Only count plateaus toward decaying the learning rate AFTER warmup is over
+            if epoch >= warmup_epochs:
+                epochs_without_lr_improvement += 1
 
         if epochs_without_lr_improvement >= lr_patience:
             new_lr = max(current_lr * lr_factor, min_lr)
             if new_lr < current_lr:
                 current_lr = new_lr
-                print(f"Reducing LR to {current_lr:.2e}")
+                print(f"📉  Plateau detected. Reducing LR to {current_lr:.2e}")
                 for group in optimizer.param_groups:
                     group["lr"] = current_lr
                 poptorch_model.setOptimizer(optimizer)

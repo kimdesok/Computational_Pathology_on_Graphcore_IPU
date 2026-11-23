@@ -1,38 +1,41 @@
 #!/usr/bin/env python
 # coding: utf-8
 #
-# One script, two jobs:
-#   MODE = "train"   -> runs on the IPU box, trains the model, saves a .pt file
-#   MODE = "compile" -> runs on the NPU box, loads that .pt file, compiles it
-#                       with RBLN SDK, and runs the test-set accuracy check
-#
-# Just flip MODE depending on which machine you're on.
-
 
 import subprocess
 import itertools
 import os
 import shutil
 
+from datetime import datetime
+
 def main():
     # datasets
     dataset_configs = [
         ("came17",  "/home/work/datasets/camelyon17_wilds", "wltjr1007/Camelyon17-WILDS"),
-        ("came16",  "/home/work/datasets/camelyon16_1aurent", "1aurent/PatchCamelyon"),
+        #("came16",  "/home/work/datasets/camelyon16_1aurent", "1aurent/PatchCamelyon"),
     ]
     # Hyperparameters Grid Search
     loop_batch_sizes = [1]
-    loop_learn_rates = [5e-8, 1e-08]  # monitor for 15 epochs and little improvement warrants large rates:5e-6
-    loop_model_names = ["vit_small_patch16_224"] #["vit_tiny_patch16_224", 
+    loop_learn_rates = [5e-06] 
+    loop_model_names = [
+        #"resnet18",
+        #"resnet34",
+        "resnet50",
+        #"vit_tiny_patch16_224",
+        #"vit_small_patch16_224",
+        #"vit_base_patch16_224"
+    ] 
+    #
     loop_aug_dps = ["color_drop_path"] #["color_jitter", "drop_path", "color_drop_path"]
     
     # Clean IPU Profile Configuration Pairing
     ipu_configs = [
-        ("model0", 1, 4, 32), 
+        #("model0", 1, 4, 8), 
         ("model1", 1, 8, 32),
-        ("hybrid0", 2, 4, 16),
-        ("hybrid1", 2, 4, 32),
-        #("data",   8, 4, 16)
+        #("hybrid0", 2, 4, 16),
+        #("hybrid1", 2, 4, 32),
+        #("data",   8, 4, 4)
     ]
     
     # Setup the localized PopTorch cache directory
@@ -85,9 +88,15 @@ def main():
 
                     try:
                         with open("sweep_error.log", "w") as err_log:
+                            # Write a header so you know which execution run failed
+                            err_log.write(f"\n--- ERROR RUN: {datetime.now()} ---\n")
+                            err_log.flush()
+        
                             proc = subprocess.Popen(
-                                ["python", "Iputrain-main.py"], env=env,
-                                stderr=subprocess.DEVNULL  # suppress the Traceback notices
+                                ["python", "Iputrain-main.py"], 
+                                env=env, 
+                                stderr=err_log,
+                                #stderr=subprocess.DEVNULL  # suppress the Traceback notices
 
                             )
                             returncode = proc.wait()
