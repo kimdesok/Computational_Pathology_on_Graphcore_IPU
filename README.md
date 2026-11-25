@@ -4,7 +4,9 @@ We will report
 2) Comparing CNN and ViT architectures — classification performance on histopathology images.
 3) Investigating IPU parallelization strategies — model parallelism, data parallelism, and hybrid parallelism.
 ## Task 1: Programming IPUs with PyTorch/PopTorch
-**Poptorch:** PopTorch is a software library developed by Graphcore that allows PyTorch models to run on its Intelligence Processing Units (IPUs). It helps developers train and test deep learning models on IPUs with minimal changes to familiar PyTorch code, while supporting different ways of distributing computations across multiple IPUs.
+**Poptorch:** PopTorch is a software library developed by Graphcore that allows PyTorch models to run on its Intelligence Processing Units (IPUs). 
+It helps developers train and test deep learning models on IPUs with minimal changes to familiar PyTorch code, 
+while supporting different ways of distributing computations across multiple IPUs.<br>
 **Dataset:** camelyon17/wilds <br>
 **Model:** ResNet-18 model <br>
 >* Resnet18 model was tried first, being the smallest kind, to test a train model, a validation model and their weight transfer between the corresponding wrappers
